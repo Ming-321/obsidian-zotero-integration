@@ -1,99 +1,139 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {Notice, Plugin} from "obsidian";
+import {DEFAULT_SETTINGS, ZoteroBasesSettings, ZoteroBasesSettingTab} from "./settings";
+import {ExportWatcher} from "./sync/watcher";
+import {createBaseFile, getBaseFilePath} from "./bases/base-generator";
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class ZoteroBasesPlugin extends Plugin {
+	settings: ZoteroBasesSettings;
+	private watcher: ExportWatcher | null = null;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		// Register commands
+		this.addCommand({
+			id: "zotero-bases-sync",
+			name: "Sync Zotero library",
+			callback: () => this.triggerSync(),
 		});
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+			id: "zotero-bases-open-base",
+			name: "Open Zotero library view",
+			callback: () => this.openBaseFile(),
+		});
+
+		// Register settings tab
+		this.addSettingTab(new ZoteroBasesSettingTab(this.app, this));
+
+		// Start watcher after layout is ready (vault fully loaded)
+		this.app.workspace.onLayoutReady(() => {
+			if (this.settings.exportFilePath && this.settings.autoSync) {
+				this.startWatcher();
 			}
 		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
 	}
 
 	onunload() {
+		this.stopWatcher();
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData() as Partial<ZoteroBasesSettings>,
+		);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	/**
+	 * Trigger a manual sync from the BBT export file.
+	 */
+	async triggerSync(): Promise<void> {
+		if (!this.settings.exportFilePath) {
+			// eslint-disable-next-line obsidianmd/ui/sentence-case
+			new Notice("Please configure the BBT export file path in settings.");
+			return;
+		}
+
+		// Ensure watcher exists (even for manual sync)
+		if (!this.watcher) {
+			this.watcher = new ExportWatcher(
+				this.app,
+				this.settings.exportFilePath,
+				this.settings.stubFolder,
+			);
+		}
+
+		const result = await this.watcher.manualSync();
+
+		// Create the .base file on first sync if it doesn't exist
+		if (result.created > 0 || result.updated > 0) {
+			const created = await createBaseFile(
+				this.app.vault,
+				this.settings.stubFolder,
+			);
+			if (created) {
+				new Notice("Created Zotero library base view file.");
+			}
+		}
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	/**
+	 * Open the .base file in the workspace.
+	 */
+	async openBaseFile(): Promise<void> {
+		const basePath = getBaseFilePath();
+		const file = this.app.vault.getFileByPath(basePath);
+
+		if (!file) {
+			new Notice("Zotero library base not found. Run a sync first.");
+			return;
+		}
+
+		await this.app.workspace.getLeaf(false).openFile(file);
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	/**
+	 * Start the file watcher for automatic sync.
+	 */
+	private startWatcher(): void {
+		if (this.watcher) {
+			this.watcher.stop();
+		}
+
+		this.watcher = new ExportWatcher(
+			this.app,
+			this.settings.exportFilePath,
+			this.settings.stubFolder,
+		);
+
+		if (this.settings.autoSync) {
+			this.watcher.start();
+		}
+	}
+
+	/**
+	 * Stop the file watcher.
+	 */
+	private stopWatcher(): void {
+		if (this.watcher) {
+			this.watcher.stop();
+			this.watcher = null;
+		}
+	}
+
+	/**
+	 * Restart the watcher (called when settings change).
+	 */
+	restartWatcher(): void {
+		this.stopWatcher();
+		if (this.settings.exportFilePath && this.settings.autoSync) {
+			this.startWatcher();
+		}
 	}
 }
